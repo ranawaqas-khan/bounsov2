@@ -185,13 +185,22 @@ def verify_email(email:str):
     local_conf, _ = local_plausibility(local)
     label, score = score_advanced(info, mx, timing_conf, local_conf)
 
-    deliverable = (label in ["valid", "likely_valid"]) and not true_catchall
+    # ✅ Corrected decision logic
+    if label == "valid":
+        deliverable = True
+        status = "valid"
+    elif label == "likely_valid":
+        deliverable = False
+        status = "invalid"
+    else:
+        deliverable = False
+        status = "invalid"
 
     return {
         "email": email,
         "esp": detect_mx_provider(mx),
         "email_type": email_type,
-        "status": label,
+        "status": status,
         "deliverable": deliverable,
         "catch_all": is_catchall,
         "score": round(score, 2)
