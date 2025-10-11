@@ -196,19 +196,3 @@ def verify_email(email:str):
         "catch_all": is_catchall,
         "score": round(score, 2)
     }
-
-# =========================
-# INTERACTIVE RUN
-# =========================
-print("🧩 Enter emails (comma or space separated):")
-user_input = input("Emails: ").strip()
-emails = [e.strip() for e in re.split(r"[, \n\t]+", user_input) if e.strip()]
-
-print("\n🚀 Verifying (stepwise: catch-all → timing → advanced)…\n")
-t0 = time.time()
-for e in emails:
-    print(f"🔍 {e}")
-    res = verify_email(e)
-    print(f"📧 {res['email']:35} → {res['status']:12} | ESP={res['esp'] or '-'} | Type={res['email_type'] or '-'} | Deliverable={res['deliverable']}")
-    print(f"    └─ Catch-All={res['catch_all']} | Score={res['score']}\n")
-print(f"✅ Done in {time.time()-t0:.2f}s | {len(emails)} emails.\n")
