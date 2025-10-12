@@ -4,12 +4,18 @@ import re, dns.resolver, smtplib, time, random, string
 # CONFIG
 # =========================
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-CORPORATE_TLDS = {"com","org","net","co","biz","ai","io","tech"}
+CORPORATE_TLDS = {"com", "org", "net", "co", "biz", "ai", "io", "tech"}
 TIMEOUT = 6
 PAUSE_BETWEEN_PROBES = 0.15
 
-FREE_PROVIDERS = {"gmail.com","yahoo.com","outlook.com","hotmail.com","icloud.com","aol.com","zoho.com","yandex.com"}
-ROLE_PREFIXES = {"info","admin","sales","support","contact","help","office","hello","team","hr","career","jobs","service","billing","marketing"}
+FREE_PROVIDERS = {
+    "gmail.com","yahoo.com","outlook.com","hotmail.com",
+    "icloud.com","aol.com","zoho.com","yandex.com"
+}
+ROLE_PREFIXES = {
+    "info","admin","sales","support","contact","help","office",
+    "hello","team","hr","career","jobs","service","billing","marketing"
+}
 
 # =========================
 # UTILITIES
@@ -17,7 +23,7 @@ ROLE_PREFIXES = {"info","admin","sales","support","contact","help","office","hel
 def random_local(k=8):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
-def detect_mx_provider(mx_host:str)->str:
+def detect_mx_provider(mx_host: str) -> str:
     h = mx_host.lower()
     if "pphosted" in h or "proofpoint" in h: return "proofpoint"
     if "outlook" in h or "protection" in h:  return "microsoft365"
@@ -28,7 +34,7 @@ def detect_mx_provider(mx_host:str)->str:
     if "yahoodns" in h:                      return "yahoo"
     return "unknown"
 
-def classify_email_type(local:str, domain:str):
+def classify_email_type(local: str, domain: str):
     d = domain.lower()
     if d in FREE_PROVIDERS:
         return "free"
@@ -39,7 +45,7 @@ def classify_email_type(local:str, domain:str):
         return "role"
     return "business"
 
-def get_domain_info(domain:str):
+def get_domain_info(domain: str):
     info = {"spf": False, "dmarc": False, "corporate": False}
     try:
         for r in dns.resolver.resolve(domain, "TXT"):
@@ -61,7 +67,7 @@ COMMON_NAME_TOKENS = {"muhammad","ahmed","ahmad","ali","abid","waqas","faiez","u
     "john","michael","david","daniel","james","robert","william","sarah","fatima","ayesha",
     "ahanger","khan","malik","hussain","hassan","asif","atif","bilal","saad","zubair","abdallah","salem"}
 
-def local_plausibility(local:str):
+def local_plausibility(local: str):
     l = local.lower()
     if l in NEGATIVE_LOCALS:
         return 0.0, "neg_local"
@@ -71,13 +77,13 @@ def local_plausibility(local:str):
         score += 0.30; notes.append("first.last")
     if any(v in l for v in "aeiou") and 3 <= len(l) <= 30:
         score += 0.10; notes.append("humanish")
-    tokens = re.split(r"[._\-]+", l)
+    tokens = re.split(r"[._\\-]+", l)
     if any(t in COMMON_NAME_TOKENS for t in tokens if 2 <= len(t) <= 20):
         score += 0.20; notes.append("name_hit")
     score = max(0.0, min(score, 0.35))
     return score, ("+".join(notes) if notes else "plain")
 
-def smtp_single_rcpt(mx:str, address:str):
+def smtp_single_rcpt(mx: str, address: str):
     try:
         s = smtplib.SMTP(timeout=TIMEOUT)
         s.connect(mx)
@@ -92,7 +98,7 @@ def smtp_single_rcpt(mx:str, address:str):
     except Exception as e:
         return None, f"error:{e}", None
 
-def smtp_multi_probe(mx:str, target_email:str, extra_fake:bool=True):
+def smtp_multi_probe(mx: str, target_email: str, extra_fake: bool=True):
     domain = target_email.split("@")[1]
     seq = [f"{random_local()}@{domain}", f"{random_local()}@{domain}", target_email]
     if extra_fake:
@@ -118,14 +124,14 @@ def smtp_multi_probe(mx:str, target_email:str, extra_fake:bool=True):
         out.append(("__connect__", None, f"connect_error:{e}", None))
     return out
 
-def analyze_catchall(seq:list, target_email:str):
+def analyze_catchall(seq: list, target_email: str):
     f1c, f2c, rc = seq[0][1], seq[1][1], seq[2][1]
     fake_250_count = sum(1 for c in (f1c, f2c) if c == 250)
     is_catchall = (fake_250_count >= 1)
     true_catchall = (fake_250_count == 2 and rc == 250)
     return is_catchall, true_catchall
 
-def analyze_timing(seq:list):
+def analyze_timing(seq: list):
     times = [t for *_ , t in seq if isinstance(t, (int,float))]
     msgs  = [m[-80:] for *_, m, _ in seq if isinstance(m,str)]
     if not times:
@@ -161,47 +167,73 @@ def score_advanced(domain_info, mx_host, timing_conf, local_conf):
 # =========================
 # MASTER VERIFY
 # =========================
-def verify_email(email:str):
+def verify_email(email: str):
+    result = {
+        "email": email, "esp": None, "email_type": None,
+        "status": "invalid", "deliverable": False, "catch_all": None,
+        "score": 0.0, "mx": None, "spf": None, "dmarc": None,
+        "corporate": None, "timing_ms": None, "timing_conf": None,
+        "entropy": None, "local_note": None, "detail": None,
+        "probe_sequence": []
+    }
+
     if not EMAIL_REGEX.match(email or ""):
-        return {"email": email, "status": "invalid", "deliverable": False, "esp": None, "email_type": None}
+        result["detail"] = "bad_syntax"
+        return result
 
     local, domain = email.split("@", 1)
-    email_type = classify_email_type(local, domain)
+    result["email_type"] = classify_email_type(local, domain)
     info = get_domain_info(domain)
+    result.update(info)
 
     try:
         mx_records = dns.resolver.resolve(domain, "MX")
         mx = str(mx_records[0].exchange)
-    except Exception:
-        return {"email": email, "status": "invalid", "deliverable": False, "esp": None, "email_type": email_type}
+        result["mx"] = mx
+        result["esp"] = detect_mx_provider(mx)
+    except Exception as e:
+        result["detail"] = f"no_mx | {e}"
+        return result
 
     fake_addr = f"{random_local()}@{domain}"
     ca_code, _, _ = smtp_single_rcpt(mx, fake_addr)
     catchall_first = (ca_code == 250)
     seq = smtp_multi_probe(mx, email, extra_fake=True)
+    result["probe_sequence"] = seq
     real_code = seq[2][1] if len(seq) >= 3 else None
+
+    if not catchall_first:
+        if real_code == 250:
+            result.update({"status": "valid","deliverable": True,"catch_all": False,"score": 1.0,
+                "detail": f"smtp_ok | MX={mx}({result['esp']}) SPF={info['spf']} DMARC={info['dmarc']} CORP={info['corporate']}"})
+            return result
+        elif real_code == 550:
+            result["detail"] = f"smtp_reject_550 | MX={mx}"
+            return result
+        elif real_code is None:
+            result["detail"] = f"smtp_timeout | MX={mx}"
+            return result
+
     is_catchall, true_catchall = analyze_catchall(seq, email)
-    timing_conf, delta_ms, entropy, _ = analyze_timing(seq)
-    local_conf, _ = local_plausibility(local)
-    label, score = score_advanced(info, mx, timing_conf, local_conf)
-
-    # ✅ Corrected decision logic
-    if label == "valid":
-        deliverable = True
-        status = "valid"
-    elif label == "likely_valid":
-        deliverable = False
-        status = "invalid"
-    else:
-        deliverable = False
-        status = "invalid"
-
-    return {
-        "email": email,
-        "esp": detect_mx_provider(mx),
-        "email_type": email_type,
-        "status": status,
-        "deliverable": deliverable,
+    timing_conf, delta_ms, entropy, timing_reason = analyze_timing(seq)
+    local_conf, local_note = local_plausibility(local)
+    result.update({
         "catch_all": is_catchall,
-        "score": round(score, 2)
-    }
+        "timing_ms": delta_ms,
+        "timing_conf": round(timing_conf, 2),
+        "entropy": entropy,
+        "local_note": local_note
+    })
+
+    label, score = score_advanced(info, mx, timing_conf, local_conf)
+    result["score"] = round(score, 2)
+    result["detail"] = f"{timing_reason} | MX={mx}({result['esp']}) SPF={info['spf']} DMARC={info['dmarc']} CORP={info['corporate']} | local_note={local_note}"
+
+    if label == "valid":
+        result["status"] = "valid"; result["deliverable"] = True
+    elif label == "likely_valid":
+        result["status"] = "invalid"; result["deliverable"] = False
+    else:
+        result["status"] = "invalid"; result["deliverable"] = False
+
+    return result
