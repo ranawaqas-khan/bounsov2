@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from verifier import verify_email
+from app.verifier import verify_email
 from typing import List
 
 app = FastAPI(title="Bounso v2 Email Verifier", version="2.0")
