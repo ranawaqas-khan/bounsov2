@@ -1,173 +1,82 @@
-"""
-FastAPI Application for Bounso.com Email Verification
-Endpoints: /verify (single) and /bulk (parallel processing)
-"""
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, validator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
-from datetime import datetime
 
-# Import verification logic
-from verifier import EmailVerifier
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# =========================
-# APP INITIALIZATION
-# =========================
+from app.verifier import verify_email
+
+# =========
+# FastAPI
+# =========
 app = FastAPI(
-    title="Bounso Email Verifier API",
-    description="High-speed email verification with deliverability scoring",
-    version="1.0.0"
+    title="Bounso v2 – Email Verifier",
+    version="2.1",
+    description="Single-probe Outlook/Gmail-safe verifier with rich JSON and bulk threading."
 )
 
-# CORS for React frontend
+# CORS (allow your domains + Clay)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Production mein specific domains add karna
+    allow_origins=[
+        "https://bounso.com",
+        "https://www.bounso.com",
+        "https://clay.run",
+        "https://www.clay.run",
+        "*",  # if you want to test freely; tighten in prod
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# PYDANTIC MODELS
-# =========================
-class EmailVerifyRequest(BaseModel):
-    email: EmailStr
+# =========
+# Models
+# =========
+class SingleEmailRequest(BaseModel):
+    email: str = Field(..., example="name@company.com")
 
-class BulkVerifyRequest(BaseModel):
-    emails: List[EmailStr]
-    
-    @validator('emails')
-    def check_limit(cls, v):
-        if len(v) > 1000:
-            raise ValueError('Maximum 1000 emails per request')
-        if len(v) == 0:
-            raise ValueError('At least 1 email required')
-        return v
+class BulkEmailRequest(BaseModel):
+    emails: List[str] = Field(..., example=["a@b.com", "c@d.com"])
+    max_workers: Optional[int] = Field(20, ge=1, le=64, description="Thread pool size")
 
-class EmailVerifyResponse(BaseModel):
-    email: str
-    status: str  # "deliverable" or "undeliverable"
-    score: int  # 0-100
-    reason: Optional[str] = None
-    
-    # Classification
-    email_type: str  # "free", "role", "business", "government"
-    is_free: bool
-    is_role: bool
-    is_disposable: bool
-    
-    # Technical details
-    mx_provider: str
-    mx_records: List[str]
-    smtp_code: Optional[int] = None
-    
-    # Metadata
-    domain: str
-    verified_at: str
-    processing_time_ms: int
 
-class BulkVerifyResponse(BaseModel):
-    total: int
-    deliverable: int
-    undeliverable: int
-    results: List[EmailVerifyResponse]
-    processing_time_ms: int
-
-# =========================
-# API ENDPOINTS
-# =========================
-
+# =========
+# Routes
+# =========
 @app.get("/")
-async def root():
-    """API health check"""
+def root():
     return {
-        "service": "Bounso Email Verifier",
-        "status": "active",
-        "version": "1.0.0",
-        "endpoints": {
-            "verify": "/verify - Single email verification",
-            "bulk": "/bulk - Bulk verification (up to 1000 emails)",
-            "health": "/health - Health check"
-        },
-        "documentation": "/docs"
+        "message": "🚀 Bounso v2 Email Verification API is running!",
+        "version": "2.1",
+        "endpoints": ["/verify", "/bulk", "/health"]
     }
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "service": "email-verifier"
-    }
+def health():
+    return {"status": "ok"}
 
-@app.post("/verify", response_model=EmailVerifyResponse)
-async def verify_email(request: EmailVerifyRequest):
+@app.post("/verify")
+def verify(request: SingleEmailRequest):
     """
-    Verify a single email address
-    
-    Returns:
-    - deliverability score (0-100)
-    - status (deliverable/undeliverable)
-    - email classification (free/role/business/government)
-    - MX provider information
-    
-    Example:
-    ```
-    POST /verify
-    {
-        "email": "test@gmail.com"
-    }
-    ```
+    Verify a single email address.
+    Returns only 'deliverable' or 'undeliverable', with a score and rich details.
     """
-    try:
-        result = EmailVerifier.verify_single(request.email)
-        return EmailVerifyResponse(**result)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Verification failed: {str(e)}"
-        )
+    return {"count": 1, "results": [verify_email(request.email)]}
 
-@app.post("/bulk", response_model=BulkVerifyResponse)
-async def verify_bulk(request: BulkVerifyRequest):
+@app.post("/bulk")
+def bulk_verify(request: BulkEmailRequest):
     """
-    Verify multiple emails in parallel (up to 1000 emails)
-    
-    High-speed processing with 50 concurrent threads
-    
-    Example:
-    ```
-    POST /bulk
-    {
-        "emails": [
-            "user1@gmail.com",
-            "user2@yahoo.com",
-            "user3@business.com"
-        ]
-    }
-    ```
-    
-    Returns:
-    - Summary statistics (total, deliverable, undeliverable)
-    - Individual results for each email
-    - Total processing time
+    Multi-threaded bulk verification.
+    - Uses one RCPT probe per email
+    - Thread pool size configurable via `max_workers`
     """
-    try:
-        result = EmailVerifier.verify_bulk(request.emails)
-        return BulkVerifyResponse(**result)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Bulk verification failed: {str(e)}"
-        )
+    emails = [e.strip() for e in request.emails if e and isinstance(e, str)]
+    results = []
+    with ThreadPoolExecutor(max_workers=request.max_workers or 20) as pool:
+        futures = {pool.submit(verify_email, e): e for e in emails}
+        for f in as_completed(futures):
+            results.append(f.result())
 
-# =========================
-# RUN SERVER
-# =========================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"count": len(results), "results": results}
