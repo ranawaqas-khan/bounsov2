@@ -1,171 +1,337 @@
-import re, dns.resolver, smtplib, time, random, string
-from statistics import mean
+"""
+Email Verification Logic for Bounso.com
+Contains all verification, classification, and scoring logic
+"""
+
+import dns.resolver
+import smtplib
+import time
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
-# CONFIG
+# CONFIGURATION
 # =========================
-EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-TIMEOUT = 6
-PAUSE_BETWEEN_PROBES = 0.08
-
-FREE_PROVIDERS = {
-    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
-    "live.com", "icloud.com", "aol.com", "zoho.com", "yandex.com"
-}
-ROLE_PREFIXES = {
-    "info","admin","sales","support","contact","help","office",
-    "hello","team","hr","career","jobs","service","billing","marketing"
-}
-DISPOSABLE_PROVIDERS = {
-    "tempmail.com","mailinator.com","guerrillamail.com",
-    "10minutemail.com","dispostable.com","trashmail.com"
-}
-
-# =========================
-# UTILITIES
-# =========================
-def random_local(k=8):
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
-
-def detect_mx_provider(mx_host:str)->str:
-    h = mx_host.lower()
-    if "outlook" in h or "protection" in h:  return "microsoft365"
-    if "google.com" in h or "aspmx" in h:    return "google"
-    if "pphosted" in h or "proofpoint" in h: return "proofpoint"
-    if "mimecast" in h:                      return "mimecast"
-    if "barracuda" in h:                     return "barracuda"
-    return "unknown"
-
-def classify_email(local:str, domain:str):
-    d = domain.lower()
-    if d in FREE_PROVIDERS: return "free"
-    if any(d.endswith(dp) for dp in DISPOSABLE_PROVIDERS): return "disposable"
-    if any(local.lower().startswith(p) for p in ROLE_PREFIXES): return "role"
-    return "business"
-
-# =========================
-# SMTP PROBING (3 probes)
-# =========================
-def smtp_multi_probe(mx:str, target_email:str):
-    domain = target_email.split("@")[1]
-    seq = [f"{random_local()}@{domain}", target_email, f"{random_local()}@{domain}"]
-    out = []
-    try:
-        s = smtplib.SMTP(timeout=TIMEOUT)
-        s.connect(mx)
-        s.helo("example.com")
-        s.mail("probe@example.com")
-
-        for a in seq:
-            start = time.perf_counter()
-            try:
-                code, msg = s.rcpt(a)
-            except Exception as e:
-                code, msg = None, str(e)
-            latency = (time.perf_counter() - start) * 1000.0
-            msg = msg.decode() if isinstance(msg, bytes) else str(msg)
-            out.append((a, code, msg.strip(), round(latency, 2)))
-            time.sleep(PAUSE_BETWEEN_PROBES)
-        s.quit()
-    except Exception as e:
-        out.append(("__connect__", None, f"connect_error:{e}", None))
-    return out
-
-# =========================
-# ANALYSIS
-# =========================
-def analyze_timing_entropy(seq):
-    times = [t for *_, t in seq if isinstance(t, (int,float))]
-    msgs  = [m[-80:] for *_, m, _ in seq if isinstance(m,str)]
-    if not times:
-        return 0, 0, 1, 0, "no_timing"
-
-    delta = int(max(times) - min(times))
-    entropy = len(set(msgs))
-    avg_latency = int(mean(times))
-
-    conf = 0.0
-    if delta > 120: conf += 0.25
-    elif delta > 80: conf += 0.18
-    elif delta > 40: conf += 0.12
-    elif delta > 10: conf += 0.06
-    if entropy > 1: conf += 0.05
-    conf = min(conf, 0.35)
-
-    return conf, delta, entropy, avg_latency, "ok"
-
-# =========================
-# VERIFY FUNCTION
-# =========================
-def verify_email(email:str):
-    result = {
-        "email": email,
-        "status": "invalid",
-        "email_type": None,
-        "provider": None,
-        "mx_record": None,
-        "deliverable": False,
-        "score": 0.0,
-        "reason": None,
-        "timing_ms": None,
-        "entropy": None,
-        "avg_latency": None
+class Config:
+    SMTP_TIMEOUT = 4
+    MAX_THREADS = 50
+    DNS_TIMEOUT = 3
+    
+    # Email classification patterns
+    FREE_PROVIDERS = {
+        "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", 
+        "icloud.com", "aol.com", "protonmail.com", "mail.com",
+        "zoho.com", "yandex.com", "gmx.com", "live.com"
+    }
+    
+    ROLE_PATTERNS = {
+        "admin", "info", "support", "sales", "contact", "help",
+        "service", "billing", "office", "team", "hr", "noreply",
+        "hello", "postmaster", "webmaster", "abuse", "security"
+    }
+    
+    GOVT_DOMAINS = {".gov", ".mil", ".edu"}
+    
+    # MX Provider detection
+    MX_PROVIDERS = {
+        "google": ["google.com", "aspmx", "googlemail"],
+        "microsoft365": ["outlook.com", "protection.outlook", "mx.microsoft"],
+        "proofpoint": ["pphosted", "proofpoint"],
+        "mimecast": ["mimecast"],
+        "barracuda": ["barracuda"],
+        "zoho": ["zoho.com", "mx.zoho"],
+        "sendgrid": ["sendgrid"],
+        "mailgun": ["mailgun"],
+        "amazon_ses": ["amazonses"]
     }
 
-    if not EMAIL_REGEX.match(email or ""):
-        result["reason"] = "bad_syntax"
-        return result
+config = Config()
 
-    local, domain = email.split("@", 1)
-    result["email_type"] = classify_email(local, domain)
-
-    # MX lookup
-    try:
-        mx = str(dns.resolver.resolve(domain, "MX")[0].exchange)
-        result["mx_record"] = mx
-        provider = detect_mx_provider(mx)
-        result["provider"] = provider
-    except Exception as e:
-        result["reason"] = f"no_mx | {e}"
-        return result
-
-    seq = smtp_multi_probe(mx, email)
-    conf, delta, entropy, avg, _ = analyze_timing_entropy(seq)
-    real_code = seq[1][1] if len(seq) >= 2 else None
-
-    # --- Logic handling by ESP ---
-    if provider == "microsoft365":
-        if real_code == 550:
-            label, deliverable = "invalid", False
-        elif delta > 120 and entropy > 2:
-            label, deliverable = "likely_valid", True
+# =========================
+# EMAIL CLASSIFICATION
+# =========================
+class EmailClassifier:
+    
+    @staticmethod
+    def classify_email(email: str, domain: str) -> Dict:
+        """Classify email into categories"""
+        local_part = email.split("@")[0].lower()
+        
+        # Check if free provider
+        is_free = domain.lower() in config.FREE_PROVIDERS
+        
+        # Check if role-based
+        is_role = any(pattern in local_part for pattern in config.ROLE_PATTERNS)
+        
+        # Check if government
+        is_govt = any(domain.endswith(suffix) for suffix in config.GOVT_DOMAINS)
+        
+        # Check if disposable (basic check)
+        is_disposable = domain.lower() in {
+            "tempmail.com", "guerrillamail.com", "10minutemail.com",
+            "throwaway.email", "mailinator.com"
+        }
+        
+        # Determine primary type
+        if is_govt:
+            email_type = "government"
+        elif is_role:
+            email_type = "role"
+        elif is_free:
+            email_type = "free"
         else:
-            label, deliverable = "risky", False
-    elif provider == "google":
-        if real_code == 550:
-            label, deliverable = "invalid", False
-        elif delta > 100 and entropy > 2:
-            label, deliverable = "likely_valid", True
-        else:
-            label, deliverable = "risky", False
-    elif real_code == 250:
-        label, deliverable = "valid", True
-    elif real_code == 550:
-        label, deliverable = "invalid", False
-    else:
-        label, deliverable = "risky", False
+            email_type = "business"
+        
+        return {
+            "email_type": email_type,
+            "is_free": is_free,
+            "is_role": is_role,
+            "is_disposable": is_disposable
+        }
 
-    # --- Score ---
-    score = min(1.0, round((conf + (entropy / 10) + (delta / 400)) / 1.2, 2))
+# =========================
+# MX PROVIDER DETECTION
+# =========================
+class MXProvider:
+    
+    @staticmethod
+    def detect_provider(mx_host: str) -> str:
+        """Detect email service provider from MX record"""
+        mx_lower = mx_host.lower()
+        
+        for provider, patterns in config.MX_PROVIDERS.items():
+            if any(pattern in mx_lower for pattern in patterns):
+                return provider
+        
+        return "other"
 
-    result.update({
-        "status": label,
-        "deliverable": deliverable,
-        "score": score,
-        "reason": "smtp_verified",
-        "timing_ms": delta,
-        "entropy": entropy,
-        "avg_latency": avg
-    })
+# =========================
+# DNS RESOLVER
+# =========================
+class DNSValidator:
+    
+    @staticmethod
+    def get_mx_records(domain: str) -> Tuple[List[str], Optional[str]]:
+        """Get MX records for domain"""
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = config.DNS_TIMEOUT
+            resolver.lifetime = config.DNS_TIMEOUT
+            
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            mx_list = [str(r.exchange).rstrip('.') for r in sorted(mx_records, key=lambda x: x.preference)]
+            
+            if not mx_list:
+                return [], "no_mx_records"
+            
+            return mx_list, None
+            
+        except dns.resolver.NXDOMAIN:
+            return [], "domain_not_exist"
+        except dns.resolver.NoAnswer:
+            return [], "no_mx_records"
+        except dns.resolver.Timeout:
+            return [], "dns_timeout"
+        except Exception:
+            return [], "dns_error"
 
-    return result
+# =========================
+# SMTP VALIDATOR
+# =========================
+class SMTPValidator:
+    
+    @staticmethod
+    def verify_smtp(mx_host: str, email: str) -> Tuple[Optional[int], Optional[str]]:
+        """Perform SMTP verification"""
+        try:
+            smtp = smtplib.SMTP(timeout=config.SMTP_TIMEOUT)
+            smtp.connect(mx_host)
+            smtp.helo("mail.bounso.com")
+            smtp.mail("verify@bounso.com")
+            
+            code, message = smtp.rcpt(email)
+            smtp.quit()
+            
+            return code, None
+            
+        except smtplib.SMTPServerDisconnected:
+            return None, "server_disconnected"
+        except smtplib.SMTPConnectError:
+            return None, "connection_refused"
+        except TimeoutError:
+            return None, "timeout"
+        except Exception:
+            return None, "smtp_error"
+
+# =========================
+# SCORING ENGINE
+# =========================
+class ScoringEngine:
+    
+    @staticmethod
+    def calculate_score(smtp_code: Optional[int], reason: Optional[str], 
+                       mx_provider: str, is_disposable: bool) -> Tuple[int, str]:
+        """
+        Calculate deliverability score (0-100)
+        Returns: (score, status)
+        """
+        
+        # Disposable email = immediate fail
+        if is_disposable:
+            return 0, "undeliverable"
+        
+        # DNS/MX errors = low score
+        if reason in ["domain_not_exist", "no_mx_records"]:
+            return 0, "undeliverable"
+        
+        if reason in ["dns_timeout", "dns_error"]:
+            return 30, "undeliverable"
+        
+        # SMTP code analysis
+        if smtp_code == 250:
+            # Deliverable - adjust by provider reliability
+            base_score = 95
+            
+            # Google/Microsoft are most reliable
+            if mx_provider in ["google", "microsoft365"]:
+                return 100, "deliverable"
+            
+            return base_score, "deliverable"
+        
+        elif smtp_code == 550:
+            # Mailbox doesn't exist
+            return 0, "undeliverable"
+        
+        elif smtp_code in [451, 452, 421]:
+            # Temporary issues - medium score
+            return 50, "undeliverable"
+        
+        elif smtp_code in [553, 554]:
+            # Rejected/blocked
+            return 5, "undeliverable"
+        
+        # Connection issues
+        if reason in ["server_disconnected", "connection_refused", "timeout"]:
+            # Can't verify but domain exists
+            return 45, "undeliverable"
+        
+        # Unknown error
+        return 35, "undeliverable"
+
+# =========================
+# MAIN VERIFIER CLASS
+# =========================
+class EmailVerifier:
+    
+    @staticmethod
+    def verify_single(email: str) -> Dict:
+        """Verify a single email address"""
+        start_time = time.perf_counter()
+        
+        # Extract domain
+        domain = email.split("@")[1].lower()
+        
+        # Classify email
+        classification = EmailClassifier.classify_email(email, domain)
+        
+        # Get MX records
+        mx_records, dns_error = DNSValidator.get_mx_records(domain)
+        
+        if dns_error:
+            score, status = ScoringEngine.calculate_score(
+                None, dns_error, "none", classification["is_disposable"]
+            )
+            
+            processing_time = int((time.perf_counter() - start_time) * 1000)
+            
+            return {
+                "email": email,
+                "status": status,
+                "score": score,
+                "reason": dns_error,
+                "mx_provider": "none",
+                "mx_records": [],
+                "smtp_code": None,
+                "domain": domain,
+                "verified_at": datetime.utcnow().isoformat(),
+                "processing_time_ms": processing_time,
+                **classification
+            }
+        
+        # Detect MX provider
+        mx_provider = MXProvider.detect_provider(mx_records[0])
+        
+        # SMTP verification
+        smtp_code, smtp_error = SMTPValidator.verify_smtp(mx_records[0], email)
+        
+        # Calculate score
+        score, status = ScoringEngine.calculate_score(
+            smtp_code, smtp_error, mx_provider, classification["is_disposable"]
+        )
+        
+        processing_time = int((time.perf_counter() - start_time) * 1000)
+        
+        return {
+            "email": email,
+            "status": status,
+            "score": score,
+            "reason": smtp_error if smtp_error else "verified",
+            "mx_provider": mx_provider,
+            "mx_records": mx_records[:3],  # Top 3 MX records
+            "smtp_code": smtp_code,
+            "domain": domain,
+            "verified_at": datetime.utcnow().isoformat(),
+            "processing_time_ms": processing_time,
+            **classification
+        }
+    
+    @staticmethod
+    def verify_bulk(emails: List[str]) -> Dict:
+        """Verify multiple emails in parallel"""
+        start_time = time.perf_counter()
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=config.MAX_THREADS) as executor:
+            future_to_email = {
+                executor.submit(EmailVerifier.verify_single, email): email 
+                for email in emails
+            }
+            
+            for future in as_completed(future_to_email):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception:
+                    email = future_to_email[future]
+                    # Fallback error response
+                    results.append({
+                        "email": email,
+                        "status": "undeliverable",
+                        "score": 0,
+                        "reason": "processing_error",
+                        "email_type": "unknown",
+                        "is_free": False,
+                        "is_role": False,
+                        "is_disposable": False,
+                        "mx_provider": "error",
+                        "mx_records": [],
+                        "smtp_code": None,
+                        "domain": email.split("@")[1],
+                        "verified_at": datetime.utcnow().isoformat(),
+                        "processing_time_ms": 0
+                    })
+        
+        # Calculate stats
+        deliverable_count = sum(1 for r in results if r["status"] == "deliverable")
+        undeliverable_count = len(results) - deliverable_count
+        
+        total_time = int((time.perf_counter() - start_time) * 1000)
+        
+        return {
+            "total": len(results),
+            "deliverable": deliverable_count,
+            "undeliverable": undeliverable_count,
+            "results": results,
+            "processing_time_ms": total_time
+        }
