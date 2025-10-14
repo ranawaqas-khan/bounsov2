@@ -1,3 +1,12 @@
-fastapi
-uvicorn
-dnspython
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic[email]==2.5.0
+dnspython==2.4.2
+python-multipart==0.0.6
+```
+
+---
+
+## 📄 **4. `Procfile`** (For Deployment)
+```
+web: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 4
