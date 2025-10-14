@@ -147,8 +147,8 @@ class SMTPValidator:
         try:
             smtp = smtplib.SMTP(timeout=config.SMTP_TIMEOUT)
             smtp.connect(mx_host)
-            smtp.helo("mail.bounso.com")
-            smtp.mail("verify@bounso.com")
+            smtp.helo("smtp.google.com")
+            smtp.mail("verify@google.com")
             
             code, message = smtp.rcpt(email)
             smtp.quit()
