@@ -6,7 +6,20 @@ from statistics import mean
 # =========================
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 TIMEOUT = 6
-PAUSE_BETWEEN_PROBES = 0.08   # faster but stable
+PAUSE_BETWEEN_PROBES = 0.08
+
+FREE_PROVIDERS = {
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
+    "live.com", "icloud.com", "aol.com", "zoho.com", "yandex.com"
+}
+ROLE_PREFIXES = {
+    "info","admin","sales","support","contact","help","office",
+    "hello","team","hr","career","jobs","service","billing","marketing"
+}
+DISPOSABLE_PROVIDERS = {
+    "tempmail.com","mailinator.com","guerrillamail.com",
+    "10minutemail.com","dispostable.com","trashmail.com"
+}
 
 # =========================
 # UTILITIES
@@ -14,7 +27,7 @@ PAUSE_BETWEEN_PROBES = 0.08   # faster but stable
 def random_local(k=8):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
-def detect_mx_provider(mx_host: str) -> str:
+def detect_mx_provider(mx_host:str)->str:
     h = mx_host.lower()
     if "outlook" in h or "protection" in h:  return "microsoft365"
     if "google.com" in h or "aspmx" in h:    return "google"
@@ -23,10 +36,17 @@ def detect_mx_provider(mx_host: str) -> str:
     if "barracuda" in h:                     return "barracuda"
     return "unknown"
 
+def classify_email(local:str, domain:str):
+    d = domain.lower()
+    if d in FREE_PROVIDERS: return "free"
+    if any(d.endswith(dp) for dp in DISPOSABLE_PROVIDERS): return "disposable"
+    if any(local.lower().startswith(p) for p in ROLE_PREFIXES): return "role"
+    return "business"
+
 # =========================
-# SMTP MULTI PROBE
+# SMTP PROBING (3 probes)
 # =========================
-def smtp_multi_probe(mx: str, target_email: str):
+def smtp_multi_probe(mx:str, target_email:str):
     domain = target_email.split("@")[1]
     seq = [f"{random_local()}@{domain}", target_email, f"{random_local()}@{domain}"]
     out = []
@@ -52,11 +72,11 @@ def smtp_multi_probe(mx: str, target_email: str):
     return out
 
 # =========================
-# TIMING + ENTROPY ANALYSIS
+# ANALYSIS
 # =========================
 def analyze_timing_entropy(seq):
-    times = [t for *_, t in seq if isinstance(t, (int, float))]
-    msgs = [m[-80:] for *_, m, _ in seq if isinstance(m, str)]
+    times = [t for *_, t in seq if isinstance(t, (int,float))]
+    msgs  = [m[-80:] for *_, m, _ in seq if isinstance(m,str)]
     if not times:
         return 0, 0, 1, 0, "no_timing"
 
@@ -75,25 +95,34 @@ def analyze_timing_entropy(seq):
     return conf, delta, entropy, avg_latency, "ok"
 
 # =========================
-# MAIN VERIFIER
+# VERIFY FUNCTION
 # =========================
-def verify_email(email: str):
+def verify_email(email:str):
     result = {
-        "email": email, "status": "invalid", "reason": None,
-        "provider": None, "mx": None,
-        "delta_ms": None, "entropy": None, "avg_latency": None,
-        "confidence": 0.0, "smtp_code": None
+        "email": email,
+        "status": "invalid",
+        "email_type": None,
+        "provider": None,
+        "mx_record": None,
+        "deliverable": False,
+        "score": 0.0,
+        "reason": None,
+        "timing_ms": None,
+        "entropy": None,
+        "avg_latency": None
     }
 
     if not EMAIL_REGEX.match(email or ""):
         result["reason"] = "bad_syntax"
         return result
 
+    local, domain = email.split("@", 1)
+    result["email_type"] = classify_email(local, domain)
+
     # MX lookup
     try:
-        domain = email.split("@")[1]
         mx = str(dns.resolver.resolve(domain, "MX")[0].exchange)
-        result["mx"] = mx
+        result["mx_record"] = mx
         provider = detect_mx_provider(mx)
         result["provider"] = provider
     except Exception as e:
@@ -107,35 +136,36 @@ def verify_email(email: str):
     # --- Logic handling by ESP ---
     if provider == "microsoft365":
         if real_code == 550:
-            label = "invalid"
+            label, deliverable = "invalid", False
         elif delta > 120 and entropy > 2:
-            label = "likely_valid"
+            label, deliverable = "likely_valid", True
         else:
-            label = "risky"
+            label, deliverable = "risky", False
     elif provider == "google":
         if real_code == 550:
-            label = "invalid"
+            label, deliverable = "invalid", False
         elif delta > 100 and entropy > 2:
-            label = "likely_valid"
+            label, deliverable = "likely_valid", True
         else:
-            label = "risky"
+            label, deliverable = "risky", False
     elif real_code == 250:
-        label = "valid"
+        label, deliverable = "valid", True
     elif real_code == 550:
-        label = "invalid"
+        label, deliverable = "invalid", False
     else:
-        label = "risky"
+        label, deliverable = "risky", False
 
-    # --- Confidence ---
-    confidence = round(min(1.0, (conf + (entropy / 10) + (delta / 400)) / 1.5), 2)
+    # --- Score ---
+    score = min(1.0, round((conf + (entropy / 10) + (delta / 400)) / 1.2, 2))
 
     result.update({
         "status": label,
-        "delta_ms": delta,
+        "deliverable": deliverable,
+        "score": score,
+        "reason": "smtp_verified",
+        "timing_ms": delta,
         "entropy": entropy,
-        "avg_latency": avg,
-        "confidence": confidence,
-        "smtp_code": real_code,
-        "reason": "smtp_verified"
+        "avg_latency": avg
     })
+
     return result
