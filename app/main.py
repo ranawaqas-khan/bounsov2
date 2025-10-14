@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
-from app.verifier import verify_email, verify_bulk_emails
+from app.verifier import verify_email
 
 # =========================
 # APP CONFIG
