@@ -57,8 +57,8 @@ def smtp_multi_probe(mx:str, target_email:str):
     try:
         s = smtplib.SMTP(timeout=TIMEOUT)
         s.connect(mx)
-        s.helo("bounso.com")
-        s.mail("probe@bounso.com")
+        s.helo("gmail.com")
+        s.mail("vreify@gmail.com")
 
         for addr in seq:
             start = time.perf_counter()
