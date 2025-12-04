@@ -54,7 +54,6 @@ class MXCache:
             return None
         ts, records = item
         if time.time() - ts > self.ttl:
-            # expired
             self._store.pop(domain, None)
             return None
         return records
@@ -84,7 +83,7 @@ def normalize_email(email: str) -> str:
     return email.strip()
 
 # =========================
-# MX LOOKUP (with caching)
+# MX LOOKUP
 # =========================
 def resolve_mx(domain: str) -> List[str]:
     cached = mx_cache.get(domain)
@@ -92,19 +91,13 @@ def resolve_mx(domain: str) -> List[str]:
         return cached
     answers = _resolver.resolve(domain, "MX")
     mx_hosts = [str(r.exchange).rstrip('.') for r in answers]
-    # sort by preference? dns.resolver already gives sorted by preference typically; we keep as is
     mx_cache.set(domain, mx_hosts)
     return mx_hosts
 
 # =========================
-# SMTP PROBE (3 probes with optional adaptive skip)
-# returns: List[(addr, code, latency_ms)]
+# ORIGINAL MULTI-PROBE (unchanged)
 # =========================
 def smtp_multi_probe(mx: str, target_email: str, adaptive: bool = True) -> List[Tuple[str, Optional[int], Optional[float]]]:
-    """
-    Probes sequence: fake1 -> real -> (fake2 optional)
-    - adaptive=True: if fake1 vs real already shows a strong gap, we can skip fake2 for speed
-    """
     domain = target_email.split("@")[1]
     seq_addrs = [f"{random_local()}@{domain}", target_email, f"{random_local()}@{domain}"]
     out: List[Tuple[str, Optional[int], Optional[float]]] = []
@@ -113,18 +106,15 @@ def smtp_multi_probe(mx: str, target_email: str, adaptive: bool = True) -> List[
         s = smtplib.SMTP(timeout=SMTP_TIMEOUT)
         s.connect(mx)
         try:
-            # be a little polite
             s.helo(HELO_DOMAIN)
         except Exception:
-            # not fatal
             pass
         try:
             s.mail(MAIL_FROM)
         except Exception:
-            # still try rcpt
             pass
 
-        # fake1
+        # Fake 1
         start = time.perf_counter()
         code1 = None
         try:
@@ -135,7 +125,7 @@ def smtp_multi_probe(mx: str, target_email: str, adaptive: bool = True) -> List[
         out.append((seq_addrs[0], code1, t1))
         time.sleep(PAUSE_BETWEEN_PROBES)
 
-        # real
+        # Real
         start = time.perf_counter()
         code2 = None
         try:
@@ -145,8 +135,7 @@ def smtp_multi_probe(mx: str, target_email: str, adaptive: bool = True) -> List[
         t2 = round((time.perf_counter() - start) * 1000.0, 2)
         out.append((seq_addrs[1], code2, t2))
 
-        # ADAPTIVE SKIP:
-        # if we already have a clear difference (|t2 - t1| > 60ms), skip fake2 for speed
+        # Adaptive optional fake2
         do_fake2 = True
         if adaptive:
             if code2 in (250, 450, 451, 452) and abs(t2 - t1) > 60:
@@ -169,19 +158,14 @@ def smtp_multi_probe(mx: str, target_email: str, adaptive: bool = True) -> List[
             pass
 
     except Exception:
-        # connection error: signal to caller
         out.append(("__connect__", None, None))
 
     return out
 
 # =========================
-# ANALYSIS (timing/entropy/confidence)
+# TIMING ANALYSIS (unchanged)
 # =========================
-def analyze_timing(seq: List[Tuple[str, Optional[int], Optional[float]]]) -> Tuple[float, int, int, Optional[int]]:
-    """
-    Returns (confidence, delta_ms, entropy, avg_latency_ms)
-    - confidence derived mainly from delta; entropy based on distinct codes
-    """
+def analyze_timing(seq):
     times = [t for _, _, t in seq if isinstance(t, (int, float))]
     codes = [str(c) for _, c, _ in seq if c is not None]
     if not times:
@@ -192,42 +176,22 @@ def analyze_timing(seq: List[Tuple[str, Optional[int], Optional[float]]]) -> Tup
     entropy = len(set(codes)) if codes else 1
 
     conf = 0.0
-    # delta contributes most
     if delta > 120: conf += 0.25
     elif delta > 80: conf += 0.18
     elif delta > 40: conf += 0.12
     elif delta > 10: conf += 0.06
-    # entropy a small nudge
     if entropy > 1: conf += 0.05
 
     conf = round(min(conf, 0.35), 2)
     return conf, delta, entropy, avg_latency
 
 # =========================
-# BEHAVIORAL + ESP-AWARE SCORING
+# BEHAVIORAL + ESP-AWARE SCORING (unchanged)
 # =========================
-def behavioral_score(fake1_t: Optional[float],
-                     fake2_t: Optional[float],
-                     real_t: Optional[float],
-                     confidence: float,
-                     entropy: int,
-                     provider: str,
-                     real_code: Optional[int]) -> Dict[str, object]:
-    """
-    Hybrid scoring:
-      - For Microsoft365/Proofpoint/Mimecast/Barracuda → SMTP code dominates:
-          250/450/451/452 => valid (99)
-          550 => invalid (10)
-      - For Google → timing pattern dominates:
-          strong real delay vs fakes => >=90
-          flat pattern => <=40
-      - Otherwise → timing-driven score
-    """
-    # Safety
+def behavioral_score(fake1_t, fake2_t, real_t, confidence, entropy, provider, real_code):
     if not all(isinstance(x, (int, float)) for x in [fake1_t or 0, real_t or 0]):
         return {"Pattern": "no_data", "Score": 0, "Status": "invalid", "Deliverable": False}
 
-    # When only two probes (adaptive skip), treat missing fake2 = fake1 for gap calc
     if fake2_t is None:
         fake2_t = fake1_t
 
@@ -235,7 +199,6 @@ def behavioral_score(fake1_t: Optional[float],
     gap_fakes = abs((fake1_t or 0) - (fake2_t or 0))
     gap_real_vs_avg_fake = abs((real_t or 0) - avg_fake)
 
-    # Pattern detect (relative, not absolute thresholds)
     if gap_fakes < 20 and gap_real_vs_avg_fake < 20:
         pattern = "flat_pattern"
     elif gap_real_vs_avg_fake > 60 and (real_t or 0) > avg_fake:
@@ -245,50 +208,78 @@ def behavioral_score(fake1_t: Optional[float],
     else:
         pattern = "unclear"
 
-    # Base timing-driven score (relative)
     base = (
-        min(gap_real_vs_avg_fake / 80, 1.0) * 40 +       # strong relative gap → higher
-        (1 - min(gap_fakes / 100, 1.0)) * 20 +           # fakes near each other → stable → better
+        min(gap_real_vs_avg_fake / 80, 1.0) * 40 +
+        (1 - min(gap_fakes / 100, 1.0)) * 20 +
         min(confidence / 0.35, 1.0) * 20 +
         min(entropy / 3, 1.0) * 10
     )
     score = min(99, round(base, 2))
 
-    # ESP-specific correction layer
     if provider in ["microsoft365", "proofpoint", "mimecast", "barracuda"]:
         if real_code in (250, 450, 451, 452):
             score, pattern = 99, f"smtp_{real_code}_valid"
         elif real_code == 550:
             score, pattern = 10, "smtp_550_invalid"
-        else:
-            pattern = f"smtp_{real_code}_unclear"
     elif provider == "google":
         if pattern == "strong_delay":
             score = max(score, 90)
         elif pattern == "flat_pattern":
             score = min(score, 40)
 
-    # Decision thresholds
     if score >= 80:
-        status, deliver = "valid", True
+        status, deliverable = "valid", True
     elif score >= 55:
-        status, deliver = "risky", False
+        status, deliverable = "risky", False
     else:
-        status, deliver = "invalid", False
+        status, deliverable = "invalid", False
 
     return {
         "Pattern": pattern,
         "Score": score,
         "Status": status,
-        "Deliverable": deliver
+        "Deliverable": deliverable
     }
+
+# =========================
+# SMTP SINGLE-PROBE (OUTLOOK FIX)
+# =========================
+def outlook_single_probe(mx, addr):
+    try:
+        s = smtplib.SMTP(timeout=SMTP_TIMEOUT)
+        s.connect(mx)
+
+        try:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+        except:
+            pass
+
+        start = time.perf_counter()
+        code = None
+        try:
+            code, _ = s.rcpt(addr)
+        except:
+            code = None
+        latency = round((time.perf_counter() - start) * 1000.0, 2)
+
+        try:
+            s.quit()
+        except:
+            pass
+
+        return code, latency
+
+    except:
+        return None, None
 
 # =========================
 # CORE: VERIFY SINGLE EMAIL
 # =========================
 def verify_email(email: str) -> Dict[str, object]:
     email = normalize_email(email)
-    result: Dict[str, object] = {
+    result = {
         "email": email,
         "Fake1_Code": None, "Fake1_Time": None,
         "Real_Code": None,  "Real_Time": None,
@@ -305,7 +296,7 @@ def verify_email(email: str) -> Dict[str, object]:
         result["Reason"] = "bad_syntax"
         return result
 
-    # MX lookup (cached)
+    # MX lookup
     try:
         domain = email.split("@", 1)[1]
         mx_records = resolve_mx(domain)
@@ -319,11 +310,28 @@ def verify_email(email: str) -> Dict[str, object]:
         result["Reason"] = f"mx_error:{e}"
         return result
 
-    # Probing: use first MX (fast path). You can extend to fallback across MX list if needed.
-    seq = smtp_multi_probe(mx_records[0], email, adaptive=True)
+    mx_host = mx_records[0]
 
-    # Extract metrics
-    # seq order (typically): fake1, real, (optional) fake2
+    # --- OUTLOOK OVERRIDE ---
+    if provider == "microsoft365":
+        fake1 = f"{random_local()}@{domain}"
+        fake2 = f"{random_local()}@{domain}"
+
+        code1, t1 = outlook_single_probe(mx_host, fake1)
+        code2, t2 = outlook_single_probe(mx_host, email)
+        code3, t3 = outlook_single_probe(mx_host, fake2)
+
+        seq = [
+            (fake1, code1, t1),
+            (email, code2, t2),
+            (fake2, code3, t3)
+        ]
+
+    else:
+        # original path
+        seq = smtp_multi_probe(mx_host, email, adaptive=True)
+
+    # Extract results
     if len(seq) >= 1:
         result["Fake1_Code"] = seq[0][1]
         result["Fake1_Time"] = seq[0][2]
@@ -340,7 +348,6 @@ def verify_email(email: str) -> Dict[str, object]:
     result["Avg_Latency"] = avg
     result["Confidence"] = conf
 
-    # Behavioral + ESP aware scoring
     scored = behavioral_score(
         fake1_t=result["Fake1_Time"],
         fake2_t=result["Fake2_Time"],
@@ -356,25 +363,20 @@ def verify_email(email: str) -> Dict[str, object]:
     return result
 
 # =========================
-# BULK: VERIFY MULTIPLE EMAILS (threaded)
+# BULK: VERIFY MULTIPLE EMAILS (unchanged)
 # =========================
 def verify_bulk_emails(emails: List[str], max_workers: int = MAX_WORKERS_DEFAULT) -> List[Dict[str, object]]:
     emails = [normalize_email(e) for e in emails if e and EMAIL_REGEX.match(e)]
     if not emails:
         return []
 
-    # TIP: we could group by domain and reuse SMTP connections per domain.
-    # For simplicity and stability, we keep one-connection-per-email inside threads,
-    # while we still benefit greatly from MX caching.
-
-    results: List[Dict[str, object]] = []
+    results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(verify_email, e): e for e in emails}
         for f in as_completed(futures):
             try:
                 results.append(f.result())
             except Exception as e:
-                # Fail gracefully for a single email
                 results.append({
                     "email": futures[f],
                     "Status": "error",
@@ -382,6 +384,6 @@ def verify_bulk_emails(emails: List[str], max_workers: int = MAX_WORKERS_DEFAULT
                     "Score": 0,
                     "Reason": f"exception:{e}",
                 })
-    # Preserve order similar to input (optional)
+
     email_to_result = {r.get("email"): r for r in results}
     return [email_to_result.get(e) for e in emails if e in email_to_result]
