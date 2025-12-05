@@ -27,8 +27,8 @@ PAUSE_BETWEEN_PROBES = float(os.getenv("PROBE_PAUSE", "0.08"))
 MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS", "20"))
 MX_CACHE_TTL = int(os.getenv("MX_CACHE_TTL", "3600"))
 
-HELO_DOMAIN = os.getenv("HELO_DOMAIN", "gmail.com")
-MAIL_FROM = os.getenv("MAIL_FROM", "verify@gmail.com")
+HELO_DOMAIN = os.getenv("HELO_DOMAIN", "example.com")
+MAIL_FROM = os.getenv("MAIL_FROM", "verify@example.com")
 
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
