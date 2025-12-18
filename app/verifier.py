@@ -1,6 +1,6 @@
 # app/verifier.py
 # Bounso Email Verifier — FastAPI backend core
-# Fixed Outlook (Microsoft 365) Handling + Restored Google Strong-Delay Logic
+# Railway-safe | IPv4-only DNS | Thread-safe SMTP
 
 from __future__ import annotations
 import os
@@ -12,19 +12,18 @@ import smtplib
 import socket
 from statistics import mean
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import dns.resolver
-
 
 # =========================
 # RUNTIME CONFIG (ENV)
 # =========================
 DNS_TIMEOUT = float(os.getenv("DNS_TIMEOUT", "3"))
-DNS_LIFETIME = float(os.getenv("DNS_LIFETIME", "3"))
+DNS_LIFETIME = float(os.getenv("DNS_LIFETIME", "5"))
 SMTP_TIMEOUT = float(os.getenv("SMTP_TIMEOUT", "6"))
 PAUSE_BETWEEN_PROBES = float(os.getenv("PROBE_PAUSE", "0.08"))
-MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS", "20"))
+MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS", "8"))
 MX_CACHE_TTL = int(os.getenv("MX_CACHE_TTL", "3600"))
 
 HELO_DOMAIN = os.getenv("HELO_DOMAIN", "example.com")
@@ -32,16 +31,29 @@ MAIL_FROM = os.getenv("MAIL_FROM", "verify@example.com")
 
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
-_resolver = dns.resolver.Resolver()
+# =========================
+# FORCE IPV4 (GLOBAL)
+# =========================
+socket.setdefaulttimeout(SMTP_TIMEOUT)
+
+# =========================
+# IPV4-ONLY DNS RESOLVER (CRITICAL FIX)
+# =========================
+_resolver = dns.resolver.Resolver(configure=False)
+_resolver.nameservers = [
+    "8.8.8.8",
+    "8.8.4.4",
+    "1.1.1.1",
+    "9.9.9.9",
+]
 _resolver.timeout = DNS_TIMEOUT
 _resolver.lifetime = DNS_LIFETIME
-
 
 # =========================
 # MX CACHE
 # =========================
 class MXCache:
-    def __init__(self, ttl: int = 3600):
+    def __init__(self, ttl: int):
         self.ttl = ttl
         self._store: Dict[str, Tuple[float, List[str]]] = {}
 
@@ -58,9 +70,7 @@ class MXCache:
     def set(self, domain: str, records: List[str]):
         self._store[domain] = (time.time(), records)
 
-
 mx_cache = MXCache(ttl=MX_CACHE_TTL)
-
 
 # =========================
 # HELPERS
@@ -68,6 +78,8 @@ mx_cache = MXCache(ttl=MX_CACHE_TTL)
 def random_local(k: int = 8) -> str:
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
+def normalize_email(email: str) -> str:
+    return email.strip()
 
 def detect_mx_provider(mx_host: str) -> str:
     h = mx_host.lower()
@@ -83,13 +95,8 @@ def detect_mx_provider(mx_host: str) -> str:
         return "barracuda"
     return "unknown"
 
-
-def normalize_email(email: str) -> str:
-    return email.strip()
-
-
 # =========================
-# MX LOOKUP
+# MX LOOKUP (SAFE)
 # =========================
 def resolve_mx(domain: str) -> List[str]:
     cached = mx_cache.get(domain)
@@ -97,16 +104,17 @@ def resolve_mx(domain: str) -> List[str]:
         return cached
 
     answers = _resolver.resolve(domain, "MX")
-    mx_hosts = [str(r.exchange).rstrip('.') for r in answers]
-
+    mx_hosts = sorted(
+        [str(r.exchange).rstrip('.') for r in answers],
+        key=lambda _: _
+    )
     mx_cache.set(domain, mx_hosts)
     return mx_hosts
 
-
 # =========================
-# ORIGINAL MULTI PROBE
+# SMTP MULTI-PROBE
 # =========================
-def smtp_multi_probe(mx: str, target_email: str, adaptive=True):
+def smtp_multi_probe(mx: str, target_email: str):
     domain = target_email.split("@")[1]
     seq_addrs = [
         f"{random_local()}@{domain}",
@@ -116,51 +124,29 @@ def smtp_multi_probe(mx: str, target_email: str, adaptive=True):
     out = []
 
     try:
-        s = smtplib.SMTP(timeout=SMTP_TIMEOUT)
-        s.connect(mx)
-
+        s = smtplib.SMTP(mx, 25, timeout=SMTP_TIMEOUT)
         try: s.helo(HELO_DOMAIN)
         except: pass
-
         try: s.mail(MAIL_FROM)
         except: pass
 
-        # Fake 1
-        start = time.perf_counter()
-        try: code1, _ = s.rcpt(seq_addrs[0])
-        except: code1 = None
-        t1 = round((time.perf_counter() - start) * 1000, 2)
-        out.append((seq_addrs[0], code1, t1))
-        time.sleep(PAUSE_BETWEEN_PROBES)
-
-        # Real
-        start = time.perf_counter()
-        try: code2, _ = s.rcpt(seq_addrs[1])
-        except: code2 = None
-        t2 = round((time.perf_counter() - start) * 1000, 2)
-        out.append((seq_addrs[1], code2, t2))
-
-        # Adaptive Fake2 Skip
-        do_fake2 = True
-        if adaptive and code2 in (250, 450, 451, 452) and abs(t2 - t1) > 60:
-            do_fake2 = False
-
-        if do_fake2:
-            time.sleep(PAUSE_BETWEEN_PROBES)
+        for addr in seq_addrs:
             start = time.perf_counter()
-            try: code3, _ = s.rcpt(seq_addrs[2])
-            except: code3 = None
-            t3 = round((time.perf_counter() - start) * 1000, 2)
-            out.append((seq_addrs[2], code3, t3))
+            try:
+                code, _ = s.rcpt(addr)
+            except:
+                code = None
+            latency = round((time.perf_counter() - start) * 1000, 2)
+            out.append((addr, code, latency))
+            time.sleep(PAUSE_BETWEEN_PROBES)
 
         try: s.quit()
         except: pass
 
-    except Exception:
+    except:
         out.append(("__connect__", None, None))
 
     return out
-
 
 # =========================
 # TIMING ANALYSIS
@@ -181,66 +167,98 @@ def analyze_timing(seq):
     elif delta > 80: conf += 0.18
     elif delta > 40: conf += 0.12
     elif delta > 10: conf += 0.06
-
-    if entropy > 1:
-        conf += 0.05
+    if entropy > 1: conf += 0.05
 
     return round(min(conf, 0.35), 2), delta, entropy, avg_latency
 
-
 # =========================
-# BEHAVIOR SCORE (WITH GOOGLE FIX)
+# BEHAVIOR SCORE
 # =========================
-def behavioral_score(fake1_t, fake2_t, real_t, confidence, entropy, provider, real_code):
-
-    if fake2_t is None:
-        fake2_t = fake1_t
-
-    avg_fake = ((fake1_t or 0) + (fake2_t or 0)) / 2
-    gap_fakes = abs((fake1_t or 0) - (fake2_t or 0))
-    gap_real = abs((real_t or 0) - avg_fake)
-
-    if gap_fakes < 20 and gap_real < 20:
-        pattern = "flat_pattern"
-    elif gap_real > 60 and (real_t or 0) > avg_fake:
-        pattern = "strong_delay"
-    elif gap_fakes < 25 and 20 <= gap_real <= 50:
-        pattern = "semi_flat"
-    else:
-        pattern = "unclear"
-
-    # Base timing score
-    base = (
-        min(gap_real / 80, 1.0) * 40 +
-        (1 - min(gap_fakes / 100, 1.0)) * 20 +
-        min(confidence / 0.35, 1.0) * 20 +
-        min(entropy / 3, 1.0) * 10
-    )
-    score = min(99, round(base, 2))
-
-    # ============================
-    # GOOGLE OVERRIDE (RESTORED)
-    # ============================
-    if provider == "google":
-        if pattern == "strong_delay":
-            score = 90
-        elif pattern == "flat_pattern":
-            score = min(score, 40)
-        else:
-            score = max(score, 75)
-
-    # ============================
-    # OUTLOOK / ENTERPRISE ESP OVERRIDE
-    # ============================
+def behavioral_score(confidence, entropy, provider, real_code):
     if provider in ["microsoft365", "proofpoint", "mimecast", "barracuda"]:
         if real_code in (250, 450, 451, 452):
-            return {"Pattern": "smtp_valid", "Score": 99, "Status": "valid", "Deliverable": True}
+            return {"Status": "valid", "Deliverable": True, "Score": 99}
         if real_code == 550:
-            return {"Pattern": "smtp_550_invalid", "Score": 10, "Status": "invalid", "Deliverable": False}
+            return {"Status": "invalid", "Deliverable": False, "Score": 10}
 
-    # Final classification
-    if score >= 80:
-        return {"Pattern": pattern, "Score": score, "Status": "valid", "Deliverable": True}
-    if score >= 55:
-        return {"Pattern": pattern, "Score": score, "Status": "risky", "Deliverable": False}
-    return {"Pattern": pattern, "Score": score, "Status": "invalid", "Deliverable": False}
+    if confidence >= 0.25:
+        return {"Status": "valid", "Deliverable": True, "Score": 85}
+    if confidence >= 0.12:
+        return {"Status": "risky", "Deliverable": False, "Score": 60}
+    return {"Status": "invalid", "Deliverable": False, "Score": 15}
+
+# =========================
+# VERIFY SINGLE EMAIL
+# =========================
+def verify_email(email: str):
+    email = normalize_email(email)
+
+    result = {
+        "email": email,
+        "Status": "invalid",
+        "Deliverable": False,
+        "Score": 0,
+        "Provider": None,
+        "Reason": None,
+        "MX": []
+    }
+
+    if not EMAIL_REGEX.match(email):
+        result["Reason"] = "bad_syntax"
+        return result
+
+    try:
+        domain = email.split("@")[1]
+        mx_records = resolve_mx(domain)
+        if not mx_records:
+            result["Reason"] = "no_mx"
+            return result
+
+        mx = mx_records[0]
+        provider = detect_mx_provider(mx)
+        result["MX"] = mx_records
+        result["Provider"] = provider
+
+    except Exception as e:
+        result["Reason"] = f"mx_error:{e}"
+        return result
+
+    seq = smtp_multi_probe(mx, email)
+    conf, delta, entropy, avg = analyze_timing(seq)
+
+    scored = behavioral_score(
+        confidence=conf,
+        entropy=entropy,
+        provider=provider,
+        real_code=seq[1][1] if len(seq) > 1 else None
+    )
+
+    result.update(scored)
+    result["Reason"] = "pattern_analysis"
+    return result
+
+# =========================
+# BULK VERIFY
+# =========================
+def verify_bulk_emails(emails, max_workers=MAX_WORKERS_DEFAULT):
+    emails = [normalize_email(e) for e in emails if EMAIL_REGEX.match(e or "")]
+    if not emails:
+        return []
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(verify_email, e): e for e in emails}
+        for f in as_completed(futures):
+            try:
+                results.append(f.result())
+            except Exception as e:
+                results.append({
+                    "email": futures[f],
+                    "Status": "error",
+                    "Deliverable": False,
+                    "Score": 0,
+                    "Reason": f"exception:{e}",
+                })
+
+    lookup = {r["email"]: r for r in results}
+    return [lookup[e] for e in emails if e in lookup]
