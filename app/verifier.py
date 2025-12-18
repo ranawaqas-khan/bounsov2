@@ -1,278 +1,246 @@
 # app/verifier.py
-# Bounso Email Verifier — Advanced SMTP Verifier (Railway-safe)
+# Bounso Email Verifier — FastAPI backend core
+# Fixed Outlook (Microsoft 365) Handling + Restored Google Strong-Delay Logic
 
 from __future__ import annotations
-import os, re, time, random, string, smtplib, socket
+import os
+import re
+import time
+import random
+import string
+import smtplib
+import socket
 from statistics import mean
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
+
 import dns.resolver
 
+
 # =========================
-# ENV CONFIG
+# RUNTIME CONFIG (ENV)
 # =========================
 DNS_TIMEOUT = float(os.getenv("DNS_TIMEOUT", "3"))
-DNS_LIFETIME = float(os.getenv("DNS_LIFETIME", "5"))
+DNS_LIFETIME = float(os.getenv("DNS_LIFETIME", "3"))
 SMTP_TIMEOUT = float(os.getenv("SMTP_TIMEOUT", "6"))
 PAUSE_BETWEEN_PROBES = float(os.getenv("PROBE_PAUSE", "0.08"))
-MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS", "10"))
+MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS", "20"))
 MX_CACHE_TTL = int(os.getenv("MX_CACHE_TTL", "3600"))
 
-HELO_DOMAIN = os.getenv("HELO_DOMAIN", "verifier.bounso.com")
-MAIL_FROM = os.getenv("MAIL_FROM", "verify@bounso.com")
+HELO_DOMAIN = os.getenv("HELO_DOMAIN", "example.com")
+MAIL_FROM = os.getenv("MAIL_FROM", "verify@example.com")
 
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
-# =========================
-# DNS (IPv4 ONLY)
-# =========================
-_resolver = dns.resolver.Resolver(configure=False)
-_resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
+_resolver = dns.resolver.Resolver()
 _resolver.timeout = DNS_TIMEOUT
 _resolver.lifetime = DNS_LIFETIME
+
 
 # =========================
 # MX CACHE
 # =========================
 class MXCache:
-    def __init__(self, ttl):
+    def __init__(self, ttl: int = 3600):
         self.ttl = ttl
-        self.store = {}
+        self._store: Dict[str, Tuple[float, List[str]]] = {}
 
-    def get(self, d):
-        if d in self.store and time.time() - self.store[d][0] < self.ttl:
-            return self.store[d][1]
-        self.store.pop(d, None)
-        return None
+    def get(self, domain: str):
+        item = self._store.get(domain)
+        if not item:
+            return None
+        ts, records = item
+        if time.time() - ts > self.ttl:
+            self._store.pop(domain, None)
+            return None
+        return records
 
-    def set(self, d, v):
-        self.store[d] = (time.time(), v)
+    def set(self, domain: str, records: List[str]):
+        self._store[domain] = (time.time(), records)
 
-mx_cache = MXCache(MX_CACHE_TTL)
+
+mx_cache = MXCache(ttl=MX_CACHE_TTL)
+
 
 # =========================
 # HELPERS
 # =========================
-def random_local(k=8):
+def random_local(k: int = 8) -> str:
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
-def detect_mx_provider(mx):
-    mx = mx.lower()
-    if "google" in mx or "aspmx" in mx: return "google"
-    if "outlook" in mx or "protection" in mx: return "microsoft365"
-    if "proofpoint" in mx: return "proofpoint"
-    if "mimecast" in mx: return "mimecast"
-    if "barracuda" in mx: return "barracuda"
+
+def detect_mx_provider(mx_host: str) -> str:
+    h = mx_host.lower()
+    if "outlook" in h or "protection" in h:
+        return "microsoft365"
+    if "google.com" in h or "aspmx" in h:
+        return "google"
+    if "pphosted" in h or "proofpoint" in h:
+        return "proofpoint"
+    if "mimecast" in h:
+        return "mimecast"
+    if "barracuda" in h:
+        return "barracuda"
     return "unknown"
 
-def resolve_ipv4(host):
-    try:
-        a = _resolver.resolve(host, "A")
-        return str(a[0])
-    except:
-        try:
-            return socket.getaddrinfo(host, 25, socket.AF_INET)[0][4][0]
-        except:
-            return None
+
+def normalize_email(email: str) -> str:
+    return email.strip()
+
 
 # =========================
 # MX LOOKUP
 # =========================
-def resolve_mx(domain):
+def resolve_mx(domain: str) -> List[str]:
     cached = mx_cache.get(domain)
-    if cached: return cached
+    if cached:
+        return cached
 
-    ans = _resolver.resolve(domain, "MX")
-    mxs = sorted([(r.preference, str(r.exchange).rstrip(".")) for r in ans])
-    hosts = [h for _, h in mxs]
-    mx_cache.set(domain, hosts)
-    return hosts
+    answers = _resolver.resolve(domain, "MX")
+    mx_hosts = [str(r.exchange).rstrip('.') for r in answers]
+
+    mx_cache.set(domain, mx_hosts)
+    return mx_hosts
+
 
 # =========================
-# SMTP MULTI PROBE (FIXED FLOW)
+# ORIGINAL MULTI PROBE
 # =========================
-def smtp_multi_probe(mx, email):
-    domain = email.split("@")[1]
-    probes = [
+def smtp_multi_probe(mx: str, target_email: str, adaptive=True):
+    domain = target_email.split("@")[1]
+    seq_addrs = [
         f"{random_local()}@{domain}",
-        email,
-        f"{random_local()}@{domain}",
+        target_email,
+        f"{random_local()}@{domain}"
     ]
     out = []
 
-    ip = resolve_ipv4(mx)
-    if not ip:
-        return [("__connect__", None, None)]
-
     try:
         s = smtplib.SMTP(timeout=SMTP_TIMEOUT)
-        s.connect(ip, 25)
+        s.connect(mx)
 
-        # EHLO / HELO
-        try:
-            s.ehlo(HELO_DOMAIN)
-        except:
-            try: s.helo(HELO_DOMAIN)
-            except: pass
+        try: s.helo(HELO_DOMAIN)
+        except: pass
 
-        # STARTTLS if available
-        try:
-            if s.has_extn("starttls"):
-                s.starttls()
-                s.ehlo(HELO_DOMAIN)
-        except:
-            pass
+        try: s.mail(MAIL_FROM)
+        except: pass
 
-        # MAIL FROM (MUST succeed)
-        try:
-            mail_code, _ = s.mail(MAIL_FROM)
-            if mail_code != 250:
-                s.quit()
-                return [("__mailfrom__", mail_code, None)]
-        except:
-            s.quit()
-            return [("__mailfrom__", None, None)]
+        # Fake 1
+        start = time.perf_counter()
+        try: code1, _ = s.rcpt(seq_addrs[0])
+        except: code1 = None
+        t1 = round((time.perf_counter() - start) * 1000, 2)
+        out.append((seq_addrs[0], code1, t1))
+        time.sleep(PAUSE_BETWEEN_PROBES)
 
-        # RCPT PROBES
-        for addr in probes:
-            start = time.perf_counter()
-            try:
-                code, _ = s.rcpt(addr)
-            except:
-                code = None
-            t = round((time.perf_counter() - start) * 1000, 2)
-            out.append((addr, code, t))
+        # Real
+        start = time.perf_counter()
+        try: code2, _ = s.rcpt(seq_addrs[1])
+        except: code2 = None
+        t2 = round((time.perf_counter() - start) * 1000, 2)
+        out.append((seq_addrs[1], code2, t2))
+
+        # Adaptive Fake2 Skip
+        do_fake2 = True
+        if adaptive and code2 in (250, 450, 451, 452) and abs(t2 - t1) > 60:
+            do_fake2 = False
+
+        if do_fake2:
             time.sleep(PAUSE_BETWEEN_PROBES)
+            start = time.perf_counter()
+            try: code3, _ = s.rcpt(seq_addrs[2])
+            except: code3 = None
+            t3 = round((time.perf_counter() - start) * 1000, 2)
+            out.append((seq_addrs[2], code3, t3))
 
         try: s.quit()
         except: pass
 
-    except:
-        return [("__connect__", None, None)]
+    except Exception:
+        out.append(("__connect__", None, None))
 
     return out
+
 
 # =========================
 # TIMING ANALYSIS
 # =========================
 def analyze_timing(seq):
-    times = [t for _,_,t in seq if isinstance(t,(int,float))]
-    codes = [str(c) for _,c,_ in seq if c]
+    times = [t for _, _, t in seq if isinstance(t, (int, float))]
+    codes = [str(c) for _, c, _ in seq if c is not None]
 
     if not times:
-        return 0, 0, 1, None
+        return 0.0, 0, 1, None
 
     delta = int(max(times) - min(times))
-    avg = int(mean(times))
-    entropy = len(set(codes))
+    avg_latency = int(mean(times))
+    entropy = len(set(codes)) if codes else 1
 
-    conf = 0
-    if delta > 120: conf += .25
-    elif delta > 80: conf += .18
-    elif delta > 40: conf += .12
-    elif delta > 10: conf += .06
-    if entropy > 1: conf += .05
+    conf = 0.0
+    if delta > 120: conf += 0.25
+    elif delta > 80: conf += 0.18
+    elif delta > 40: conf += 0.12
+    elif delta > 10: conf += 0.06
 
-    return round(min(conf,.35),2), delta, entropy, avg
+    if entropy > 1:
+        conf += 0.05
 
-# =========================
-# BEHAVIOR SCORE (503 FIX)
-# =========================
-def behavioral_score(f1, f2, real, conf, entropy, provider, real_code):
+    return round(min(conf, 0.35), 2), delta, entropy, avg_latency
 
-    if real_code in (503, 530, 454, 421):
-        return {
-            "Pattern": "smtp_blocked",
-            "Score": 50,
-            "Status": "risky",
-            "Deliverable": False
-        }
-
-    if provider in ["microsoft365","proofpoint","mimecast","barracuda"]:
-        if real_code in (250,450,451,452):
-            return {"Pattern":"smtp_valid","Score":99,"Status":"valid","Deliverable":True}
-        if real_code == 550:
-            return {"Pattern":"smtp_550","Score":10,"Status":"invalid","Deliverable":False}
-
-    avg_fake = ((f1 or 0)+(f2 or f1 or 0))/2
-    gap_real = abs((real or 0)-avg_fake)
-
-    score = min(99, round(
-        min(gap_real/80,1)*40 +
-        min(conf/.35,1)*40 +
-        min(entropy/3,1)*19
-    ,2))
-
-    if provider=="google":
-        score = max(score,75)
-
-    if score>=80:
-        return {"Pattern":"timing_valid","Score":score,"Status":"valid","Deliverable":True}
-    if score>=55:
-        return {"Pattern":"timing_risky","Score":score,"Status":"risky","Deliverable":False}
-
-    return {"Pattern":"timing_invalid","Score":score,"Status":"invalid","Deliverable":False}
 
 # =========================
-# VERIFY SINGLE
+# BEHAVIOR SCORE (WITH GOOGLE FIX)
 # =========================
-def verify_email(email):
-    result = {
-        "email": email,
-        "Status":"invalid",
-        "Deliverable":False,
-        "Score":0,
-        "Provider":None,
-        "Pattern":None,
-        "Reason":None,
-        "MX":[]
-    }
+def behavioral_score(fake1_t, fake2_t, real_t, confidence, entropy, provider, real_code):
 
-    if not EMAIL_REGEX.match(email):
-        result["Reason"]="bad_syntax"
-        return result
+    if fake2_t is None:
+        fake2_t = fake1_t
 
-    domain = email.split("@")[1]
-    try:
-        mxs = resolve_mx(domain)
-        if not mxs:
-            result["Reason"]="no_mx"
-            return result
-    except Exception as e:
-        result["Reason"]=f"mx_error:{e}"
-        return result
+    avg_fake = ((fake1_t or 0) + (fake2_t or 0)) / 2
+    gap_fakes = abs((fake1_t or 0) - (fake2_t or 0))
+    gap_real = abs((real_t or 0) - avg_fake)
 
-    mx = mxs[0]
-    provider = detect_mx_provider(mx)
-    result["MX"]=mxs
-    result["Provider"]=provider
+    if gap_fakes < 20 and gap_real < 20:
+        pattern = "flat_pattern"
+    elif gap_real > 60 and (real_t or 0) > avg_fake:
+        pattern = "strong_delay"
+    elif gap_fakes < 25 and 20 <= gap_real <= 50:
+        pattern = "semi_flat"
+    else:
+        pattern = "unclear"
 
-    seq = smtp_multi_probe(mx,email)
-
-    if seq and seq[0][0].startswith("__"):
-        result["Pattern"]="smtp_blocked"
-        result["Status"]="risky"
-        result["Score"]=50
-        result["Reason"]="smtp_policy"
-        return result
-
-    f1, f2, real = seq[0][2], seq[2][2] if len(seq)>2 else None, seq[1][2]
-    conf, delta, entropy, avg = analyze_timing(seq)
-
-    scored = behavioral_score(
-        f1, f2, real, conf, entropy,
-        provider,
-        seq[1][1] if len(seq)>1 else None
+    # Base timing score
+    base = (
+        min(gap_real / 80, 1.0) * 40 +
+        (1 - min(gap_fakes / 100, 1.0)) * 20 +
+        min(confidence / 0.35, 1.0) * 20 +
+        min(entropy / 3, 1.0) * 10
     )
+    score = min(99, round(base, 2))
 
-    result.update(scored)
-    result["Reason"]="pattern_analysis"
-    return result
+    # ============================
+    # GOOGLE OVERRIDE (RESTORED)
+    # ============================
+    if provider == "google":
+        if pattern == "strong_delay":
+            score = 90
+        elif pattern == "flat_pattern":
+            score = min(score, 40)
+        else:
+            score = max(score, 75)
 
-# =========================
-# BULK
-# =========================
-def verify_bulk_emails(emails, max_workers=MAX_WORKERS_DEFAULT):
-    emails = [e for e in emails if EMAIL_REGEX.match(e or "")]
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        return list(ex.map(verify_email, emails))
+    # ============================
+    # OUTLOOK / ENTERPRISE ESP OVERRIDE
+    # ============================
+    if provider in ["microsoft365", "proofpoint", "mimecast", "barracuda"]:
+        if real_code in (250, 450, 451, 452):
+            return {"Pattern": "smtp_valid", "Score": 99, "Status": "valid", "Deliverable": True}
+        if real_code == 550:
+            return {"Pattern": "smtp_550_invalid", "Score": 10, "Status": "invalid", "Deliverable": False}
+
+    # Final classification
+    if score >= 80:
+        return {"Pattern": pattern, "Score": score, "Status": "valid", "Deliverable": True}
+    if score >= 55:
+        return {"Pattern": pattern, "Score": score, "Status": "risky", "Deliverable": False}
+    return {"Pattern": pattern, "Score": score, "Status": "invalid", "Deliverable": False}
